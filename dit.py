@@ -89,26 +89,20 @@ class Attention(nn.Module):
         self.k_norm = nn.LayerNorm(self.n_heads * self.head_dim)
 
     @staticmethod
-    def reshape_for_broadcast(freqs_cis, x):
-        ndim = x.ndim
-        assert 0 <= 1 < ndim
-        # assert freqs_cis.shape == (x.shape[1], x.shape[-1])
-        _freqs_cis = freqs_cis[: x.shape[1]]
-        shape = [d if i == 1 or i == ndim - 1 else 1 for i, d in enumerate(x.shape)]
-        return _freqs_cis.view(*shape)
+    def apply_rotary_emb(xq, xk, freqs_cos, freqs_sin):
+        freqs_cos_ = freqs_cos.unsqueeze(0).unsqueeze(2)
+        freqs_sin_ = freqs_sin.unsqueeze(0).unsqueeze(2)
 
-    @staticmethod
-    def apply_rotary_emb(xq, xk, freqs_cis):
-        xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
-        xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
-        freqs_cis_xq = Attention.reshape_for_broadcast(freqs_cis, xq_)
-        freqs_cis_xk = Attention.reshape_for_broadcast(freqs_cis, xk_)
-
-        xq_out = torch.view_as_real(xq_ * freqs_cis_xq).flatten(3)
-        xk_out = torch.view_as_real(xk_ * freqs_cis_xk).flatten(3)
+        # # (bongwonjang): rotate_half를 사용하지 않는 방식. 
+        # # freqs_cos.shape = freqs_sin.shape = [4096, 16]
+        # # precompute_freqs_cos_sin에서 freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[:(dim // 2)].float() / dim))을 사용
+        xq1, xq2 = xq[..., :16], xq[..., 16:]
+        xk1, xk2 = xk[..., :16], xk[..., 16:]
+        xq_out = torch.cat([xq1 * freqs_cos_ - xq2 * freqs_sin_, xq1 * freqs_sin_ + xq2 * freqs_cos_], dim=-1)
+        xk_out = torch.cat([xk1 * freqs_cos_ - xk2 * freqs_sin_, xk1 * freqs_sin_ + xk2 * freqs_cos_], dim=-1)
         return xq_out, xk_out
 
-    def forward(self, x, freqs_cis):
+    def forward(self, x, freqs_cos, freqs_sin):
         bsz, seqlen, _ = x.shape
 
         xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
@@ -122,7 +116,7 @@ class Attention(nn.Module):
         xk = xk.view(bsz, seqlen, self.n_heads, self.head_dim)
         xv = xv.view(bsz, seqlen, self.n_heads, self.head_dim)
 
-        xq, xk = self.apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
+        xq, xk = self.apply_rotary_emb(xq, xk, freqs_cos=freqs_cos, freqs_sin=freqs_sin)
         xq, xk = xq.to(dtype), xk.to(dtype)
 
         output = F.scaled_dot_product_attention(
@@ -185,20 +179,20 @@ class TransformerBlock(nn.Module):
             nn.Linear(min(dim, 1024), 6 * dim, bias=True),
         )
 
-    def forward(self, x, freqs_cis, adaln_input=None):
+    def forward(self, x, freqs_cos, freqs_sin, adaln_input=None):
         if adaln_input is not None:
             shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
                 self.adaLN_modulation(adaln_input).chunk(6, dim=1)
             )
 
             x = x + gate_msa.unsqueeze(1) * self.attention(
-                modulate(self.attention_norm(x), shift_msa, scale_msa), freqs_cis
+                modulate(self.attention_norm(x), shift_msa, scale_msa), freqs_cos, freqs_sin
             )
             x = x + gate_mlp.unsqueeze(1) * self.feed_forward(
                 modulate(self.ffn_norm(x), shift_mlp, scale_mlp)
             )
         else:
-            x = x + self.attention(self.attention_norm(x), freqs_cis)
+            x = x + self.attention(self.attention_norm(x), freqs_cos, freqs_sin)
             x = x + self.feed_forward(self.ffn_norm(x))
 
         return x
@@ -278,7 +272,8 @@ class DiT_Llama(nn.Module):
         )
         self.final_layer = FinalLayer(dim, patch_size, self.out_channels)
 
-        self.freqs_cis = DiT_Llama.precompute_freqs_cis(dim // n_heads, 4096)
+        # (bongwonjang): 
+        self.freqs_cos, self.freqs_sin = DiT_Llama.precompute_freqs_cos_sin(dim // n_heads, 4096)
 
     def unpatchify(self, x):
         c = self.out_channels
@@ -303,8 +298,6 @@ class DiT_Llama(nn.Module):
         return x
 
     def forward(self, x, t, y):
-        self.freqs_cis = self.freqs_cis.to(x.device)
-
         x = self.init_conv_seq(x)
 
         x = self.patchify(x)
@@ -315,7 +308,10 @@ class DiT_Llama(nn.Module):
         adaln_input = t.to(x.dtype) + y.to(x.dtype)
 
         for layer in self.layers:
-            x = layer(x, self.freqs_cis[: x.size(1)], adaln_input=adaln_input)
+            x = layer(x, 
+                      self.freqs_cos[: x.size(1)],
+                      self.freqs_sin[: x.size(1)], 
+                      adaln_input=adaln_input)
 
         x = self.final_layer(x, adaln_input)
         x = self.unpatchify(x)  # (N, out_channels, H, W)
@@ -332,13 +328,16 @@ class DiT_Llama(nn.Module):
         eps = torch.cat([half_eps, half_eps], dim=0)
         return torch.cat([eps, rest], dim=1)
 
+    # (bongwonjang)
     @staticmethod
-    def precompute_freqs_cis(dim, end, theta=10000.0):
+    def precompute_freqs_cos_sin(dim, end, theta=10000.0):
         freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
+        
         t = torch.arange(end)
         freqs = torch.outer(t, freqs).float()
-        freqs_cis = torch.polar(torch.ones_like(freqs), freqs)
-        return freqs_cis
+        freqs_cos = torch.cos(freqs).to("cuda:0")
+        freqs_sin = torch.sin(freqs).to("cuda:0")
+        return freqs_cos, freqs_sin
 
 
 def DiT_Llama_600M_patch2(**kwargs):

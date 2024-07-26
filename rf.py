@@ -3,6 +3,9 @@ import argparse
 
 import torch
 
+# (bongwonjang): random seed 고정
+torch.manual_seed(0)
+torch.cuda.manual_seed(0)
 
 class RF:
     def __init__(self, model, ln=True):
@@ -55,7 +58,8 @@ if __name__ == "__main__":
     from torchvision.utils import make_grid
     from tqdm import tqdm
 
-    import wandb
+    # (bongwonjang): wandb는 사용하지 않겠습니다.
+    # import wandb
     from dit import DiT_Llama
 
     parser = argparse.ArgumentParser(description="use cifar?")
@@ -102,21 +106,24 @@ if __name__ == "__main__":
     criterion = torch.nn.MSELoss()
 
     mnist = fdatasets(root="./data", train=True, download=True, transform=transform)
-    dataloader = DataLoader(mnist, batch_size=256, shuffle=True, drop_last=True)
+    # (bongwonjang): 원격 서버가 느리기 때문에 RTX 3060 (12GB)에서 작업 중입니다.
+    # 원래 batch_size=256을 batch_size=16으로 줄여 12GB VRAM에서 모델이 실행될 수 있도록 설정합니다.
+    dataloader = DataLoader(mnist, batch_size=16, shuffle=True, drop_last=True)
 
-    wandb.init(project=f"rf_{dataset_name}")
-
-    for epoch in range(100):
+    # (bongwonjang): 코드 수정 중에는 epoch를 100에서 1으로 줄이고 iteration을 10번만 돌겠습니다.
+    # 이후 ONNX 파일 추출 때는 iteration을 5번만 돌겠습니다.
+    for epoch in range(5):
         lossbin = {i: 0 for i in range(10)}
         losscnt = {i: 1e-6 for i in range(10)}
         for i, (x, c) in tqdm(enumerate(dataloader)):
+            if i == 10:
+                break
+
             x, c = x.cuda(), c.cuda()
             optimizer.zero_grad()
             loss, blsct = rf.forward(x, c)
             loss.backward()
             optimizer.step()
-
-            wandb.log({"loss": loss.item()})
 
             # count based on t
             for t, l in blsct:
@@ -126,8 +133,6 @@ if __name__ == "__main__":
         # log
         for i in range(10):
             print(f"Epoch: {epoch}, {i} range loss: {lossbin[i] / losscnt[i]}")
-
-        wandb.log({f"lossbin_{i}": lossbin[i] / losscnt[i] for i in range(10)})
 
         rf.model.eval()
         with torch.no_grad():
