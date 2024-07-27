@@ -184,4 +184,4 @@ if __name__ == "__main__":
     rf.model.eval()
     _ = rf.model(dummy_zt_input, dummy_t_input, dummy_cond_input)
     input_args = (dummy_zt_input, dummy_t_input, dummy_cond_input)
-    torch.onnx.export(rf.model, input_args, "minDF.onnx")
+    torch.onnx.export(rf.model, input_args, "minRF.onnx")
